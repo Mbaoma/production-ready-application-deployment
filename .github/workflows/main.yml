@@ -1,0 +1,123 @@
+name: Build, Push to ECR and Deploy to EC2
+
+on:
+  pull_request:
+    branches:
+      - main
+
+  push:
+    branches:
+      - dev
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+  IMAGE_TAG: ${{ github.sha }}
+
+jobs:
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r application/requirements.txt
+          pip install pytest httpx
+
+      - name: Run tests
+        run: |
+          pytest application/test_api.py
+
+  build-and-deploy:
+    name: Build, Push and Deploy
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: test
+
+    if: github.event_name == 'push' && github.ref == 'refs/heads/dev'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set image URI
+        run: |
+          echo "IMAGE_URI=${{ steps.ecr-login.outputs.registry }}/${{ secrets.ECR_REPOSITORY }}:${{ github.sha }}" >> $GITHUB_ENV
+          echo "LATEST_IMAGE_URI=${{ steps.ecr-login.outputs.registry }}/${{ secrets.ECR_REPOSITORY }}:latest" >> $GITHUB_ENV
+
+      - name: Build and push Docker image to ECR
+        run: |
+          ls
+          docker build -t $IMAGE_URI -t $LATEST_IMAGE_URI ./application
+          docker push $IMAGE_URI
+          docker push $LATEST_IMAGE_URI
+
+      - name: Prepare SSH key
+        run: |
+            mkdir -p ~/.ssh
+
+            if [ -z "${{ secrets.EC2_SSH_KEY }}" ]; then
+            echo "EC2_SSH_KEY secret is empty or missing"
+            exit 1
+            fi
+
+            echo "${{ secrets.EC2_SSH_KEY }}" > ~/.ssh/ec2_key
+            chmod 600 ~/.ssh/ec2_key
+
+            ssh-keyscan -H ${{ secrets.EC2_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Deploy to EC2
+        run: |
+            ssh -i ~/.ssh/ec2_key ${{ secrets.EC2_USERNAME }}@${{ secrets.EC2_HOST }} << EOF
+            set -e
+
+            APP_DIR="/opt/fastapi-devops-assessment"
+
+            sudo mkdir -p \$APP_DIR
+            sudo chown -R ${{ secrets.EC2_USERNAME }}:${{ secrets.EC2_USERNAME }} \$APP_DIR
+
+            cd \$APP_DIR
+
+            cat > docker-compose.yml << COMPOSE
+            services:
+                api:
+                    image: $IMAGE_URI
+                    container_name: fastapi-api
+                    restart: unless-stopped
+                    ports:
+                    - "80:8000"
+                    environment:
+                    - ENVIRONMENT=production
+            COMPOSE
+
+            aws ecr get-login-password --region ${{ secrets.AWS_REGION }} | docker login --username AWS --password-stdin ${{ steps.ecr-login.outputs.registry }}
+
+            docker compose pull
+            docker compose up -d --remove-orphans
+            docker image prune -f
+            EOF
